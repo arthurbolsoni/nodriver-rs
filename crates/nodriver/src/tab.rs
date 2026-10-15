@@ -1,7 +1,7 @@
 //! A page target with its own session. Mirrors nodriver's `core/tab.py`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nodriver_cdp::{Command, Event, input, page, runtime, target};
@@ -24,11 +24,13 @@ const FIND_JS: &str = include_str!("js/find.js");
 struct Inner {
     conn: Connection,
     target_id: String,
-    session_id: String,
-    page_enabled: AtomicBool,
+    /// Connection generation in which `Page.enable` was sent (0 = never). A reconnection
+    /// creates a new session, where `Page` is disabled again.
+    page_enabled_in: AtomicU64,
 }
 
-/// A tab (page target). Cheap to clone; clones share the session.
+/// A tab (page target). Cheap to clone; clones share the session. Commands go to the session
+/// currently attached to the target, so a tab keeps working after the connection reconnects.
 #[derive(Clone)]
 pub struct Tab {
     inner: Arc<Inner>,
@@ -43,13 +45,12 @@ impl std::fmt::Debug for Tab {
 }
 
 impl Tab {
-    pub(crate) fn new(conn: Connection, target_id: String, session_id: String) -> Self {
+    pub(crate) fn new(conn: Connection, target_id: String) -> Self {
         Self {
             inner: Arc::new(Inner {
                 conn,
                 target_id,
-                session_id,
-                page_enabled: AtomicBool::new(false),
+                page_enabled_in: AtomicU64::new(0),
             }),
         }
     }
@@ -58,8 +59,9 @@ impl Tab {
         &self.inner.target_id
     }
 
-    pub fn session_id(&self) -> &str {
-        &self.inner.session_id
+    /// Session currently attached to this tab (changes after a reconnection).
+    pub fn session_id(&self) -> Option<String> {
+        self.inner.conn.session_of(&self.inner.target_id)
     }
 
     pub fn connection(&self) -> &Connection {
@@ -68,35 +70,34 @@ impl Tab {
 
     /// Sends a typed command in this tab's session.
     pub async fn send<C: Command>(&self, cmd: &C) -> Result<C::Returns> {
-        self.inner.conn.send(cmd, Some(&self.inner.session_id)).await
+        self.inner.conn.send_target(cmd, &self.inner.target_id).await
     }
 
     /// Sends a command by name with raw JSON params in this tab's session.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.inner
             .conn
-            .call(method, params, Some(&self.inner.session_id))
+            .call_target(method, params, &self.inner.target_id)
             .await
     }
 
     /// Typed events of this tab. The domain must be enabled for most events.
     pub fn subscribe<E: Event>(&self) -> EventStream<E> {
-        self.inner.conn.subscribe(Some(&self.inner.session_id))
+        self.inner.conn.subscribe_target(&self.inner.target_id)
     }
 
     /// Raw events of this tab; `method` as in [`Connection::subscribe_raw`].
     pub fn subscribe_raw(&self, method: Option<&str>) -> RawEventStream {
         self.inner
             .conn
-            .subscribe_raw(method, Some(&self.inner.session_id))
+            .subscribe_raw_target(method, &self.inner.target_id)
     }
 
     async fn ensure_page_enabled(&self) -> Result<()> {
-        if !self.inner.page_enabled.swap(true, Ordering::SeqCst) {
-            if let Err(e) = self.send(&page::EnableParams::new()).await {
-                self.inner.page_enabled.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
+        let generation = self.inner.conn.generation();
+        if self.inner.page_enabled_in.load(Ordering::SeqCst) != generation {
+            self.send(&page::EnableParams::new()).await?;
+            self.inner.page_enabled_in.store(generation, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -290,6 +291,7 @@ impl Tab {
                 None,
             )
             .await?;
+        self.inner.conn.forget_target(&self.inner.target_id);
         Ok(())
     }
 

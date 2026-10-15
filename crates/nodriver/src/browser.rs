@@ -174,7 +174,13 @@ impl Browser {
             .filter(|t| t.r#type == "page")
             .collect();
         let alive: Vec<String> = pages.iter().map(|t| t.target_id.clone()).collect();
-        self.tabs.lock().unwrap().retain(|id, _| alive.contains(id));
+        self.tabs.lock().unwrap().retain(|id, _| {
+            let keep = alive.contains(id);
+            if !keep {
+                self.conn.forget_target(id);
+            }
+            keep
+        });
         let mut out = Vec::with_capacity(pages.len());
         for t in pages {
             out.push(self.tab(&t.target_id).await?);
@@ -187,10 +193,8 @@ impl Browser {
         if let Some(t) = self.tabs.lock().unwrap().get(target_id) {
             return Ok(t.clone());
         }
-        let mut p = target::AttachToTargetParams::new(target_id.to_string());
-        p.flatten = Some(true);
-        let session = self.conn.send(&p, None).await?.session_id;
-        let tab = Tab::new(self.conn.clone(), target_id.to_string(), session);
+        self.conn.attach(target_id).await?;
+        let tab = Tab::new(self.conn.clone(), target_id.to_string());
         self.tabs
             .lock()
             .unwrap()
@@ -230,9 +234,10 @@ impl Browser {
         Ok(tab)
     }
 
-    /// Closes the browser (`Browser.close`), waits for its process to exit (killing it after
+    /// Turns off automatic reconnection, closes the browser (`Browser.close`), waits for its process to exit (killing it after
     /// 10 s) and deletes the temporary profile, if any.
     pub async fn close(&self) -> Result<()> {
+        self.conn.set_auto_reconnect(false);
         let _ = self
             .conn
             .call_with_timeout(

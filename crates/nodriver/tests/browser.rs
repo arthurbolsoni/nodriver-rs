@@ -204,7 +204,7 @@ async fn network_events() {
     assert!(urls.iter().any(|u| u.ends_with("/api/data")), "{urls:?}");
     let first = raw.next().await.unwrap();
     assert!(first.method.starts_with("Network."));
-    assert_eq!(first.session_id.as_deref(), Some(tab.session_id()));
+    assert_eq!(first.session_id, tab.session_id());
     browser.close().await.unwrap();
 }
 

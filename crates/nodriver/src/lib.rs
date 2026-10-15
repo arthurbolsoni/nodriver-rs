@@ -24,7 +24,9 @@ mod util;
 
 pub use browser::Browser;
 pub use config::{Config, DEFAULT_ARGS, find_browser};
-pub use connection::{Connection, DEFAULT_TIMEOUT, EventStream, RawEvent, RawEventStream};
+pub use connection::{
+    Connection, DEFAULT_TIMEOUT, EventStream, RECONNECT_ATTEMPTS, RECONNECTED_EVENT, RawEvent, RawEventStream,
+};
 pub use element::{Element, Rect};
 pub use error::{Error, Result};
 pub use nodriver_cdp as cdp;

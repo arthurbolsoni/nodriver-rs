@@ -47,6 +47,11 @@ async fn main() -> nodriver::Result<()> {
 - A profile held by a running browser fails with `Error::ProfileInUse` instead of handing the launch
   over to that browser.
 - Microsoft Edge is used when Chrome is not installed.
+- The websocket reconnects on its own while the browser runs: tabs get new sessions and keep
+  working, per-tab and browser-wide subscriptions keep receiving events, and a
+  `Nodriver.reconnected` event is delivered. Commands in flight when the link dropped fail with
+  `Error::Disconnected` and are not resent. Domains enabled by the caller (`Network.enable`, ...)
+  must be enabled again. `Browser::close` turns reconnection off.
 
 ## CDP types
 
