@@ -21,7 +21,8 @@ pub const DEFAULT_ARGS: &[&str] = &[
 /// How to launch the browser.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Profile directory. `None` creates a temporary profile that is deleted by `Browser::close`.
+    /// Profile directory. `None` creates a temporary profile that is deleted by `Browser::close`
+    /// or when the `Browser` is dropped. A directory given here is never deleted.
     pub user_data_dir: Option<PathBuf>,
     /// `--headless=new`.
     pub headless: bool,

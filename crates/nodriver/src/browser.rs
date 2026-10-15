@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nodriver_cdp::{browser as cdp_browser, target};
@@ -66,20 +66,84 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Custom process starter for [`Browser::launch_with`].
 type Spawn = Box<dyn FnOnce(&Path, &[String]) -> std::io::Result<()> + Send>;
 
+/// How many times a temporary profile is deleted before giving up, and the pause between tries.
+/// The browser's child processes release their files a moment after it exits on Windows.
+const REMOVE_TRIES: u32 = 40;
+const REMOVE_PAUSE: Duration = Duration::from_millis(250);
+
 /// A running browser, launched by this process or attached over its debug port.
+///
+/// `Browser` is not `Clone`; share it with `Arc<Browser>`. A browser started by
+/// [`Browser::launch`] or [`Browser::launch_with`] that is dropped without [`Browser::close`]
+/// (including during a panic) is stopped on drop: its process is killed and the temporary
+/// profile, if the crate created one, is deleted. The drop blocks the current thread while it
+/// waits for the process to exit and for the profile files to be released. A profile passed in
+/// [`Config::user_data_dir`] is never deleted, and a browser attached with [`Browser::connect`]
+/// is left running.
 pub struct Browser {
     conn: Connection,
     ws_url: String,
     host: String,
     port: u16,
-    /// Process started by `launch`. Edge on Windows relaunches itself, so this process may
-    /// exit right away while the browser keeps running as its child.
-    launcher: Mutex<Option<Child>>,
+    /// What `launch` started; `None` for `connect` and after `close`.
+    launched: Mutex<Option<Launched>>,
     /// Pid of the browser process, from `SystemInfo.getProcessInfo`.
     browser_pid: Option<u32>,
     user_data_dir: Option<PathBuf>,
-    temp_profile: Mutex<Option<tempfile::TempDir>>,
     tabs: Mutex<HashMap<String, Tab>>,
+}
+
+/// Process and temporary profile started by `launch`. Dropping it kills the process and deletes
+/// the temporary profile; `close` empties it first so the drop has nothing left to do.
+struct Launched {
+    /// Process started by `launch` (not by `launch_with`). Edge on Windows relaunches itself,
+    /// so this process may exit right away while the browser keeps running as its child.
+    launcher: Option<Child>,
+    /// Pid of the browser process, once known.
+    pid: Option<u32>,
+    temp_profile: Option<tempfile::TempDir>,
+}
+
+impl Drop for Launched {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.launcher.take() {
+            let _ = child.start_kill();
+        }
+        if let Some(pid) = self.pid.take() {
+            kill_process(pid);
+            let start = Instant::now();
+            while process_alive(pid) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if let Some(t) = self.temp_profile.take() {
+            let path = t.path().to_path_buf();
+            for _ in 0..REMOVE_TRIES {
+                if std::fs::remove_dir_all(&path).is_ok() || !path.exists() {
+                    break;
+                }
+                std::thread::sleep(REMOVE_PAUSE);
+            }
+            if path.exists() {
+                tracing::warn!("temporary profile left behind: {}", path.display());
+            }
+        }
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        let launched = self
+            .launched
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if launched.is_some() {
+            // Tabs may still hold the connection; it must not reconnect to the killed browser.
+            self.conn.set_auto_reconnect(false);
+        }
+        drop(launched);
+    }
 }
 
 impl std::fmt::Debug for Browser {
@@ -119,14 +183,23 @@ impl Browser {
         if !exe.is_file() {
             return Err(Error::Launch(format!("executable not found: {}", exe.display())));
         }
-        let (user_data_dir, temp_profile) = match &config.user_data_dir {
+        // Holds what is started from here on; an early return or a cancelled launch drops it,
+        // which stops the process and deletes the temporary profile.
+        let mut launched = Launched {
+            launcher: None,
+            pid: None,
+            temp_profile: None,
+        };
+        let user_data_dir = match &config.user_data_dir {
             Some(d) => {
                 std::fs::create_dir_all(d)?;
-                (d.clone(), None)
+                d.clone()
             }
             None => {
                 let t = tempfile::Builder::new().prefix("uc_").tempdir()?;
-                (t.path().to_path_buf(), Some(t))
+                let path = t.path().to_path_buf();
+                launched.temp_profile = Some(t);
+                path
             }
         };
         if profile_locked(&user_data_dir) {
@@ -138,7 +211,7 @@ impl Browser {
         };
         let args = config.build_args(&user_data_dir, port);
         tracing::debug!("launching {} {}", exe.display(), args.join(" "));
-        let mut child = match spawn {
+        launched.launcher = match spawn {
             Some(spawn) => {
                 spawn(&exe, &args).map_err(|e| Error::Launch(format!("{}: {e}", exe.display())))?;
                 None
@@ -154,18 +227,18 @@ impl Browser {
             ),
         };
 
-        let ws_url = wait_debugger(&config.host, port, child.as_mut()).await?;
+        let ws_url = wait_debugger(&config.host, port, launched.launcher.as_mut()).await?;
         let conn = Connection::connect(&ws_url).await?;
         let browser_pid = browser_pid(&conn).await;
+        launched.pid = browser_pid;
         Ok(Self {
             conn,
             ws_url,
             host: config.host.clone(),
             port,
-            launcher: Mutex::new(child),
+            launched: Mutex::new(Some(launched)),
             browser_pid,
             user_data_dir: Some(user_data_dir),
-            temp_profile: Mutex::new(temp_profile),
             tabs: Mutex::new(HashMap::new()),
         })
     }
@@ -185,10 +258,9 @@ impl Browser {
             ws_url,
             host: host.to_string(),
             port,
-            launcher: Mutex::new(None),
+            launched: Mutex::new(None),
             browser_pid,
             user_data_dir: None,
-            temp_profile: Mutex::new(None),
             tabs: Mutex::new(HashMap::new()),
         })
     }
@@ -370,8 +442,9 @@ impl Browser {
         Ok(tab)
     }
 
-    /// Turns off automatic reconnection, closes the browser (`Browser.close`), waits for its process to exit (killing it after
-    /// 10 s) and deletes the temporary profile, if any.
+    /// Turns off automatic reconnection, closes the browser (`Browser.close`), waits for its
+    /// process to exit (killing it after 10 s) and deletes the temporary profile, if any.
+    /// Without `close`, dropping a launched `Browser` kills the process instead (see [`Browser`]).
     pub async fn close(&self) -> Result<()> {
         self.conn.set_auto_reconnect(false);
         let _ = self
@@ -383,14 +456,15 @@ impl Browser {
                 Duration::from_secs(5),
             )
             .await;
-        let launcher = self.launcher.lock().unwrap().take();
-        if let Some(mut child) = launcher {
-            if tokio::time::timeout(Duration::from_secs(10), child.wait())
+        // Taken out of `self` but kept alive until the end: if this future is dropped midway,
+        // `Launched`'s drop finishes the job.
+        let mut launched = self.launched.lock().unwrap().take();
+        if let Some(child) = launched.as_mut().and_then(|l| l.launcher.as_mut())
+            && tokio::time::timeout(Duration::from_secs(10), child.wait())
                 .await
                 .is_err()
-            {
-                let _ = child.kill().await;
-            }
+        {
+            let _ = child.kill().await;
         }
         if let Some(pid) = self.browser_pid {
             let start = Instant::now();
@@ -402,17 +476,23 @@ impl Browser {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        let temp = self.temp_profile.lock().unwrap().take();
-        if let Some(t) = temp {
-            let path = t.path().to_path_buf();
+        let Some(l) = launched.as_mut() else {
+            return Ok(());
+        };
+        l.launcher = None;
+        l.pid = None;
+        if let Some(path) = l.temp_profile.as_ref().map(|t| t.path().to_path_buf()) {
             // Child processes can keep files open for a moment after the browser exits.
-            for _ in 0..40 {
+            for _ in 0..REMOVE_TRIES {
                 if std::fs::remove_dir_all(&path).is_ok() || !path.exists() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(REMOVE_PAUSE).await;
             }
-            drop(t);
+            if path.exists() {
+                tracing::warn!("temporary profile left behind: {}", path.display());
+            }
+            l.temp_profile = None;
         }
         Ok(())
     }

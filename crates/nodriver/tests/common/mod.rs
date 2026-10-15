@@ -61,3 +61,21 @@ pub fn config() -> Config {
 pub async fn browser() -> Browser {
     Browser::launch(config()).await.expect("launch browser")
 }
+
+/// Whether a process with this pid is running.
+pub fn process_alive(pid: u32) -> bool {
+    if cfg!(windows) {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    } else {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+}

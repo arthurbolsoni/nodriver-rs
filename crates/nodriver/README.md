@@ -114,7 +114,7 @@ All methods are `async` and return `nodriver::Result`.
 | `util.ProxyForwarder`, proxies with credentials in `create_context` | Local proxy server that forwards to an authenticated upstream proxy. `create_context` takes proxies without credentials. |
 | `tab.get_frames()` / `IFrame` | Out-of-process iframes are off with the default flags (`site-per-process` disabled); `browser.tab(target_id)` attaches to any target. |
 | `util.filter_recurse*`, `flatten_frame_tree*`, `html_from_tree`, `remove_from_tree`, `el.update()`, `el.tree`, `el.node` and the `Node` properties | Work on a local copy of the DOM tree. An `Element` here is a live handle; queries run in the page. |
-| `util.create_from_undetected_chromedriver`, `util.deconstruct_browser`, registered instances | Python process management; `Browser::close` stops the browser and deletes the temporary profile. |
+| `util.create_from_undetected_chromedriver`, `util.deconstruct_browser`, registered instances | Python process management; `Browser::close` stops the browser and deletes the temporary profile, and dropping a launched `Browser` does the same (see [Dropping a browser without `close`](#dropping-a-browser-without-close)). |
 | Packed `.crx` extensions in `add_extension` | Pass the unpacked directory. |
 
 ## Differences
@@ -148,6 +148,30 @@ All methods are `async` and return `nodriver::Result`.
 - `Element::set_value` sets the `value` property and fires `input`/`change`; nodriver's
   `DOM.setNodeValue` only changes text nodes, which is `set_text` here.
 - `text_all` trims each text node and skips the empty ones.
+
+## Dropping a browser without `close`
+
+nodriver registers every browser it starts and stops them in an `atexit` handler. Here the
+`Browser` value owns what it started:
+
+- A browser started by `Browser::launch` or `Browser::launch_with` and dropped without `close`
+  (including when a panic unwinds through its owner) is stopped on drop: reconnection is turned
+  off, the browser process and its child processes are killed, and the temporary profile created
+  by the crate is deleted, retrying for up to 10 s while the browser's processes release their
+  files. The drop blocks the current thread until then.
+- A profile passed in `Config::user_data_dir` is never deleted.
+- A browser attached with `Browser::connect` keeps running when its `Browser` is dropped.
+- `Browser` is not `Clone`. Shared through `Arc<Browser>`, it is stopped when the last `Arc` is
+  dropped. `Tab`s do not keep the browser running; after the drop their commands fail.
+- A launch that fails after starting the process (no DevTools endpoint, failed connection) or
+  whose future is dropped kills the process spawned by `launch` and deletes the temporary
+  profile. The browser pid is only known once the DevTools connection is up, so a process
+  started by `launch_with`, or the one Edge relaunches itself into on Windows, is not killed at
+  that stage.
+- `close` is the graceful path (`Browser.close`, then up to 10 s for the process to exit). After
+  `close`, the drop does nothing.
+- Nothing runs when the process ends without unwinding (`std::process::exit`, `panic = "abort"`,
+  a killed process).
 
 ## CDP types
 
