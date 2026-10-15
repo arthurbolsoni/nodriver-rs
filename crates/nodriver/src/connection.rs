@@ -120,6 +120,8 @@ struct Inner {
     link: Mutex<Link>,
     sessions: Mutex<Sessions>,
     reconnect_lock: tokio::sync::Mutex<()>,
+    /// Serializes `attach`: two concurrent attaches to one target would create two sessions.
+    attach_lock: tokio::sync::Mutex<()>,
     auto_reconnect: AtomicBool,
     timeout: Mutex<Duration>,
 }
@@ -154,6 +156,7 @@ impl Connection {
             }),
             sessions: Mutex::new(Sessions::default()),
             reconnect_lock: tokio::sync::Mutex::new(()),
+            attach_lock: tokio::sync::Mutex::new(()),
             auto_reconnect: AtomicBool::new(true),
             timeout: Mutex::new(DEFAULT_TIMEOUT),
         });
@@ -205,6 +208,10 @@ impl Connection {
     /// reconnection. Returns the existing session when the target is already attached.
     pub async fn attach(&self, target_id: &str) -> Result<String> {
         self.ensure_link(false).await?;
+        if let Some(s) = self.session_of(target_id) {
+            return Ok(s);
+        }
+        let _vez = self.inner.attach_lock.lock().await;
         if let Some(s) = self.session_of(target_id) {
             return Ok(s);
         }
