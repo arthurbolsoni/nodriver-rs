@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Scroll</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  #box { height: 200px; overflow-y: auto; border: 1px solid #888; }
+  #box div { height: 40px; }
+  .item { height: 120px; border-bottom: 1px solid #ccc; }
+</style>
+</head>
+<body>
+  <div id="box"></div>
+  <div id="list"></div>
+  <div id="sentinel">loading</div>
+  <script>
+    const box = document.getElementById('box');
+    for (let i = 0; i < 50; i++) {
+      const d = document.createElement('div');
+      d.textContent = 'box ' + i;
+      box.appendChild(d);
+    }
+    // Infinite list: 20 items per batch, more when the sentinel comes into view, 4 batches.
+    const list = document.getElementById('list');
+    const sentinel = document.getElementById('sentinel');
+    let batches = 0;
+    function load() {
+      if (batches >= 4) {
+        sentinel.textContent = 'end';
+        return;
+      }
+      batches++;
+      for (let i = 0; i < 20; i++) {
+        const d = document.createElement('div');
+        d.className = 'item';
+        d.textContent = 'item ' + list.children.length;
+        list.appendChild(d);
+      }
+    }
+    load();
+    new IntersectionObserver((es) => {
+      if (es.some((e) => e.isIntersecting)) setTimeout(load, 100);
+    }).observe(sentinel);
+  </script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Drag</title>
+<style>
+  body { margin: 0; }
+  #handle { position: absolute; z-index: 2; left: 50px; top: 50px; width: 60px; height: 60px; background: #c33; }
+  #target { position: absolute; left: 300px; top: 200px; width: 100px; height: 100px; background: #33c; }
+</style>
+</head>
+<body>
+  <div id="handle"></div>
+  <div id="target"></div>
+  <script>
+    const handle = document.getElementById('handle');
+    const target = document.getElementById('target');
+    let drag = null;
+    window.moves = 0;
+    window.dropped = false;
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // no text selection, which a later press would drag natively
+      drag = { dx: e.clientX - handle.offsetLeft, dy: e.clientY - handle.offsetTop };
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!drag || !(e.buttons & 1)) return;
+      window.moves++;
+      handle.style.left = (e.clientX - drag.dx) + 'px';
+      handle.style.top = (e.clientY - drag.dy) + 'px';
+    });
+    document.addEventListener('mouseup', (e) => {
+      if (!drag) return;
+      drag = null;
+      const r = target.getBoundingClientRect();
+      window.dropped = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    });
+    handle.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      window.context = { button: e.button, ctrl: e.ctrlKey };
+    });
+  </script>
+</body>
+</html>

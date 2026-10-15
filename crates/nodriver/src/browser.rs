@@ -7,15 +7,58 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nodriver_cdp::{browser as cdp_browser, target};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
 use crate::config::{Config, find_browser};
 use crate::connection::Connection;
+use crate::cookies::CookieJar;
 use crate::error::{Error, Result};
 use crate::tab::Tab;
+
+/// `Browser.PermissionType` values tried by [`Browser::grant_all_permissions`].
+const PERMISSIONS: &[&str] = &[
+    "ar",
+    "audioCapture",
+    "automaticFullscreen",
+    "backgroundFetch",
+    "backgroundSync",
+    "cameraPanTiltZoom",
+    "clipboardReadWrite",
+    "clipboardSanitizedWrite",
+    "displayCapture",
+    "durableStorage",
+    "geolocation",
+    "handTracking",
+    "idleDetection",
+    "keyboardLock",
+    "localFonts",
+    "localNetwork",
+    "localNetworkAccess",
+    "loopbackNetwork",
+    "midi",
+    "midiSysex",
+    "nfc",
+    "notifications",
+    "paymentHandler",
+    "periodicBackgroundSync",
+    "pointerLock",
+    "protectedMediaIdentifier",
+    "sensors",
+    "smartCard",
+    "speakerSelection",
+    "storageAccess",
+    "topLevelStorageAccess",
+    "videoCapture",
+    "vr",
+    "wakeLockScreen",
+    "wakeLockSystem",
+    "webAppInstallation",
+    "webPrinting",
+    "windowManagement",
+];
 
 /// How long to wait for a launched browser to expose its DevTools endpoint.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -256,6 +299,74 @@ impl Browser {
         }
         let tab = self.main_tab().await?;
         tab.navigate(url).await?;
+        Ok(tab)
+    }
+
+    /// Cookies of the default context (nodriver's `browser.cookies`).
+    pub fn cookies(&self) -> CookieJar<'_> {
+        CookieJar::new(&self.conn)
+    }
+
+    /// Grants every permission type to every origin (geolocation, notifications, clipboard,
+    /// camera, ...). Types the browser refuses are skipped; returns the ones granted.
+    pub async fn grant_all_permissions(&self) -> Result<Vec<String>> {
+        let all: Vec<&str> = PERMISSIONS.to_vec();
+        if self
+            .conn
+            .call("Browser.grantPermissions", json!({ "permissions": all }), None)
+            .await
+            .is_ok()
+        {
+            return Ok(all.iter().map(|s| s.to_string()).collect());
+        }
+        // A call grants its list and rejects every other type, so the accepted types are found
+        // one by one and granted together at the end.
+        let mut granted = Vec::new();
+        for p in all {
+            if self
+                .conn
+                .call("Browser.grantPermissions", json!({ "permissions": [p] }), None)
+                .await
+                .is_ok()
+            {
+                granted.push(p.to_string());
+            }
+        }
+        if granted.is_empty() {
+            return Err(Error::NotFound("the browser granted no permission".into()));
+        }
+        self.conn
+            .call(
+                "Browser.grantPermissions",
+                json!({ "permissions": granted }),
+                None,
+            )
+            .await?;
+        Ok(granted)
+    }
+
+    /// Opens `url` in a tab of a new browser context (separate cookies, storage and cache), with
+    /// its own proxy when `proxy_server` is given (`http://host:port`, `socks5://host:port`;
+    /// proxies with credentials are not supported). The context is disposed when the tab closes
+    /// or this connection ends. Waits for the load event, as [`Browser::new_tab`].
+    pub async fn create_context(
+        &self,
+        url: &str,
+        proxy_server: Option<&str>,
+        proxy_bypass_list: Option<&str>,
+    ) -> Result<Tab> {
+        let mut p = target::CreateBrowserContextParams::new();
+        p.dispose_on_detach = Some(true);
+        p.proxy_server = proxy_server.map(str::to_string);
+        p.proxy_bypass_list = proxy_bypass_list.map(str::to_string);
+        let ctx = self.conn.send(&p, None).await?.browser_context_id;
+        let mut t = target::CreateTargetParams::new("about:blank");
+        t.browser_context_id = Some(ctx);
+        let id = self.conn.send(&t, None).await?.target_id;
+        let tab = self.tab(&id).await?;
+        if url != "about:blank" {
+            tab.navigate(url).await?;
+        }
         Ok(tab)
     }
 

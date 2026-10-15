@@ -6,7 +6,8 @@ use nodriver::{Browser, Config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Serves `tests/fixtures` on 127.0.0.1 and `/api/data` as JSON. Returns the base URL.
+/// Serves `tests/fixtures` on 127.0.0.1 and `/api/data` as JSON. Returns the base URL. Also
+/// answers proxy requests (absolute URI) with the same files.
 pub async fn serve() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -21,7 +22,11 @@ pub async fn serve() -> String {
                 let mut buf = vec![0u8; 8192];
                 let n = s.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let mut path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                // Absolute URI: the browser uses this server as its HTTP proxy.
+                if let Some(rest) = path.strip_prefix("http://") {
+                    path = rest.find('/').map_or("/".into(), |i| rest[i..].to_string());
+                }
                 let (status, ctype, body): (&str, &str, Vec<u8>) = if path == "/api/data" {
                     (
                         "200 OK",

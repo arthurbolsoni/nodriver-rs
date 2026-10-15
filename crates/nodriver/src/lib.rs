@@ -17,6 +17,7 @@
 mod browser;
 mod config;
 mod connection;
+mod cookies;
 mod element;
 mod error;
 mod tab;
@@ -27,7 +28,8 @@ pub use config::{Config, DEFAULT_ARGS, find_browser};
 pub use connection::{
     Connection, DEFAULT_TIMEOUT, EventStream, RECONNECT_ATTEMPTS, RECONNECTED_EVENT, RawEvent, RawEventStream,
 };
+pub use cookies::{CookieJar, to_param as cookie_to_param};
 pub use element::{Element, Rect};
 pub use error::{Error, Result};
 pub use nodriver_cdp as cdp;
-pub use tab::{DEFAULT_WAIT, OBJECT_GROUP, Tab};
+pub use tab::{DEFAULT_WAIT, ImageFormat, OBJECT_GROUP, Tab};

@@ -2,6 +2,7 @@
 pub mod browser;
 pub mod debugger;
 pub mod dom;
+pub mod dom_storage;
 pub mod emulation;
 pub mod fetch;
 pub mod input;

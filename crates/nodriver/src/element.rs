@@ -1,13 +1,14 @@
 //! A handle to a DOM element (a `Runtime.RemoteObject`). Mirrors nodriver's `core/element.py`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use nodriver_cdp::{dom, runtime};
+use nodriver_cdp::{dom, input, page, runtime};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::tab::{OBJECT_GROUP, Tab, array_elements, exception_text, js_str};
+use crate::tab::{ImageFormat, OBJECT_GROUP, Tab, array_elements, exception_text, js_str, write_file};
 
 /// Element handle. Valid while the node exists in the page; a re-render that replaces the node
 /// leaves the handle pointing to the detached node.
@@ -220,6 +221,201 @@ impl Element {
         p.object_id = Some(self.object_id.clone());
         self.tab.send(&p).await?;
         Ok(())
+    }
+
+    /// Text of every descendant text node, trimmed and joined with spaces; includes `<script>`
+    /// and hidden text (nodriver's `text_all`).
+    pub async fn text_all(&self) -> Result<String> {
+        self.apply_as(
+            "(el) => { const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); const out = []; \
+             if (el.nodeType === 3) out.push(el.nodeValue.trim()); \
+             while (w.nextNode()) { const t = w.currentNode.nodeValue.trim(); if (t) out.push(t); } \
+             return out.filter(Boolean).join(' '); }",
+        )
+        .await
+    }
+
+    /// Every attribute, by name.
+    pub async fn attributes(&self) -> Result<HashMap<String, String>> {
+        self.apply_as("(el) => Object.fromEntries(Array.from(el.attributes || [], (a) => [a.name, a.value]))")
+            .await
+    }
+
+    pub async fn set_attribute(&self, name: &str, value: &str) -> Result<()> {
+        self.apply(&format!(
+            "(el) => el.setAttribute({}, {})",
+            js_str(name),
+            js_str(value)
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_attribute(&self, name: &str) -> Result<()> {
+        self.apply(&format!("(el) => el.removeAttribute({})", js_str(name)))
+            .await?;
+        Ok(())
+    }
+
+    /// Parent element; `None` for the root.
+    pub async fn parent(&self) -> Result<Option<Element>> {
+        let obj = self.call_function("(el) => el.parentElement", false).await?;
+        Ok(obj.object_id.map(|id| Element::new(self.tab.clone(), id)))
+    }
+
+    /// Child elements; for a same-origin `<iframe>`, the children of its document.
+    pub async fn children(&self) -> Result<Vec<Element>> {
+        let obj = self
+            .call_function(
+                "(el) => { let d = null; try { d = el.contentDocument; } catch (e) {} \
+                 return Array.from((d || el).children || []); }",
+                false,
+            )
+            .await?;
+        match obj.object_id {
+            Some(id) => array_elements(&self.tab, &id).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Removes the node from the document (nodriver's `remove_from_dom`).
+    pub async fn remove(&self) -> Result<()> {
+        self.apply("(el) => el.remove()").await?;
+        Ok(())
+    }
+
+    /// Calls a method of the element without arguments, e.g. `play` on a video (nodriver's
+    /// `element(js_method)`).
+    pub async fn call_method(&self, method: &str) -> Result<Value> {
+        self.apply(&format!("(el) => el[{}]()", js_str(method))).await
+    }
+
+    /// Sets `value` with the native setter and fires `input` and `change`, so frameworks with
+    /// controlled inputs see it. nodriver's `set_value` uses `DOM.setNodeValue`, which only
+    /// changes text nodes; that is [`Element::set_text`] here.
+    pub async fn set_value(&self, value: &str) -> Result<()> {
+        self.apply(&format!(
+            "(el) => {{ const p = Object.getPrototypeOf(el); \
+             const d = Object.getOwnPropertyDescriptor(p, 'value'); \
+             if (d && d.set) d.set.call(el, {v}); else el.value = {v}; \
+             el.dispatchEvent(new Event('input', {{bubbles: true}})); \
+             el.dispatchEvent(new Event('change', {{bubbles: true}})); }}",
+            v = js_str(value)
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Replaces the text of a text node, or of an element whose only child is a text node
+    /// (nodriver's `set_text`).
+    pub async fn set_text(&self, value: &str) -> Result<()> {
+        self.apply(&format!(
+            "(el) => {{ const t = el.nodeType === 3 ? el \
+             : (el.childNodes.length === 1 && el.firstChild.nodeType === 3 ? el.firstChild : null); \
+             if (!t) throw new Error('set_text needs a text node or an element with one text child'); \
+             t.nodeValue = {}; }}",
+            js_str(value)
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Box in document coordinates (viewport box plus the scroll offset), as nodriver's
+    /// `get_position(abs=True)`.
+    pub async fn document_rect(&self) -> Result<Rect> {
+        let r = self.rect().await?;
+        let (sx, sy): (f64, f64) = self
+            .tab
+            .evaluate_as("[window.scrollX, window.scrollY]")
+            .await
+            .map(|v: Vec<f64>| (v[0], v[1]))?;
+        Ok(Rect {
+            left: r.left + sx,
+            top: r.top + sy,
+            ..r
+        })
+    }
+
+    /// Click at the element's center with any button and modifiers.
+    pub async fn mouse_click_with(&self, button: input::MouseButton, modifiers: i64) -> Result<()> {
+        self.scroll_into_view().await?;
+        let (x, y) = self.rect().await?.center();
+        self.tab.mouse_click_with(x, y, button, modifiers).await
+    }
+
+    /// Drags from the element's center to viewport point `(x, y)` (nodriver's `mouse_drag`).
+    pub async fn mouse_drag_to(&self, x: f64, y: f64, steps: u32) -> Result<()> {
+        let from = self.drag_start().await?;
+        self.tab.mouse_drag(from, (x, y), steps).await
+    }
+
+    /// Drags from the element's center by `(dx, dy)` pixels (nodriver's `mouse_drag` with
+    /// `relative=True`).
+    pub async fn mouse_drag_by(&self, dx: f64, dy: f64, steps: u32) -> Result<()> {
+        let from = self.drag_start().await?;
+        self.tab.mouse_drag(from, (from.0 + dx, from.1 + dy), steps).await
+    }
+
+    /// Drags from the element's center to the center of `target`.
+    pub async fn mouse_drag_to_element(&self, target: &Element, steps: u32) -> Result<()> {
+        let from = self.drag_start().await?;
+        let to = target.rect().await?.center();
+        self.tab.mouse_drag(from, to, steps).await
+    }
+
+    async fn drag_start(&self) -> Result<(f64, f64)> {
+        self.scroll_into_view().await?;
+        Ok(self.rect().await?.center())
+    }
+
+    /// Scrolls the element's own content (a list with its own scrollbar) down by `percent` of the
+    /// element's height, with a scroll gesture at its center. Scrolling chains to the page once
+    /// the element reaches its end.
+    pub async fn scroll_down(&self, percent: f64) -> Result<()> {
+        let r = self.rect().await?;
+        let (x, y) = r.center();
+        self.tab
+            .scroll_gesture(x, y, 0.0, r.height * percent / 100.0)
+            .await
+    }
+
+    /// Scrolls the element's own content up; see [`Element::scroll_down`].
+    pub async fn scroll_up(&self, percent: f64) -> Result<()> {
+        let r = self.rect().await?;
+        let (x, y) = r.center();
+        self.tab
+            .scroll_gesture(x, y, 0.0, -r.height * percent / 100.0)
+            .await
+    }
+
+    /// Screenshot of the element's box, scrolled into view first; `scale` 1 keeps the CSS size
+    /// (nodriver's `save_screenshot` of an element).
+    pub async fn screenshot(&self, format: ImageFormat, scale: f64) -> Result<Vec<u8>> {
+        self.scroll_into_view().await?;
+        let r = self.rect().await?;
+        if r.width <= 0.0 || r.height <= 0.0 {
+            return Err(Error::NotFound("element has an empty box".into()));
+        }
+        let m = self.tab.send(&page::GetLayoutMetricsParams::new()).await?;
+        let mut p = page::CaptureScreenshotParams::new();
+        p.format = Some(format.cdp());
+        p.clip = Some(page::Viewport {
+            x: r.left + m.css_visual_viewport.page_x,
+            y: r.top + m.css_visual_viewport.page_y,
+            width: r.width,
+            height: r.height,
+            scale,
+        });
+        p.capture_beyond_viewport = Some(true);
+        let data = self.tab.send(&p).await?.data;
+        crate::util::base64_decode(&data).ok_or_else(|| Error::Js("invalid base64 screenshot".into()))
+    }
+
+    /// Writes a screenshot of the element to `path`; JPEG for `.jpg`/`.jpeg`, PNG otherwise.
+    pub async fn save_screenshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let data = self.screenshot(ImageFormat::from_path(path), 1.0).await?;
+        write_file(path, &data)
     }
 
     /// Selects this `<option>` and fires `change` on its `<select>` (nodriver's `select_option`).

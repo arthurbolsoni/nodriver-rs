@@ -26,6 +26,7 @@ const DOMAINS: &[&str] = &[
     "Security",
     "Log",
     "IO",
+    "DOMStorage",
 ];
 
 #[derive(Deserialize)]
