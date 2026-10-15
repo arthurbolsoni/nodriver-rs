@@ -251,3 +251,41 @@ async fn browser_pid_known_and_gone_after_close() {
         "pid {pid} still running"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_with_custom_spawner() {
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = spawned.clone();
+    let browser = Browser::launch_with(common::config(), move |exe, args| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::process::Command::new(exe)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+    })
+    .await
+    .unwrap();
+    assert!(spawned.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(browser.pid().is_some());
+    let tab = browser.main_tab().await.unwrap();
+    assert_eq!(tab.evaluate("2 * 21").await.unwrap(), json!(42));
+    let profile = browser.user_data_dir().unwrap().to_path_buf();
+    browser.close().await.unwrap();
+    assert!(!profile.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn navigator_webdriver_is_false() {
+    // Headful, as in real use; the window is placed off screen.
+    let cfg = nodriver::Config::new()
+        .arg("--disable-sync")
+        .arg("--window-position=-32000,-32000");
+    let browser = Browser::launch(cfg).await.unwrap();
+    let tab = browser.main_tab().await.unwrap();
+    tab.navigate("about:blank").await.unwrap();
+    assert_eq!(tab.evaluate("navigator.webdriver").await.unwrap(), json!(false));
+    browser.close().await.unwrap();
+}

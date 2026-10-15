@@ -41,7 +41,8 @@ async fn main() -> nodriver::Result<()> {
 - One websocket per browser; tabs use flattened sessions (`Target.attachToTarget { flatten: true }`).
 - Domains are enabled only when needed. `Page.enable` is sent before the first navigation of a tab;
   `Runtime.enable` is never sent.
-- The debug port defaults to 0; the port is read from `DevToolsActivePort` in the profile.
+- `--remote-debugging-port=0` is never used: with it, Edge reports `navigator.webdriver === true`.
+  A free port is picked before launching, as nodriver does.
 - `Config::lang` sets `--lang` and `--accept-lang` (nodriver stores `lang` but does not pass it).
 - Packed `.crx` extensions are not unpacked; pass extension directories.
 - A profile held by a running browser fails with `Error::ProfileInUse` instead of handing the launch

@@ -20,6 +20,9 @@ use crate::tab::Tab;
 /// How long to wait for a launched browser to expose its DevTools endpoint.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Custom process starter for [`Browser::launch_with`].
+type Spawn = Box<dyn FnOnce(&Path, &[String]) -> std::io::Result<()> + Send>;
+
 /// A running browser, launched by this process or attached over its debug port.
 pub struct Browser {
     conn: Connection,
@@ -51,6 +54,20 @@ impl Browser {
     /// Fails with [`Error::ProfileInUse`] when another browser process holds the profile
     /// (Chrome/Edge would hand the launch over to it).
     pub async fn launch(config: Config) -> Result<Self> {
+        Self::launch_inner(config, None).await
+    }
+
+    /// Like [`Browser::launch`], but the process is started by `spawn(executable, args)`, for
+    /// example on another Windows desktop or inside a job object. The browser is then found
+    /// through its debug port as usual, and `close` stops it through CDP and its pid.
+    pub async fn launch_with<F>(config: Config, spawn: F) -> Result<Self>
+    where
+        F: FnOnce(&Path, &[String]) -> std::io::Result<()> + Send + 'static,
+    {
+        Self::launch_inner(config, Some(Box::new(spawn))).await
+    }
+
+    async fn launch_inner(config: Config, spawn: Option<Spawn>) -> Result<Self> {
         let exe = config
             .executable
             .clone()
@@ -72,21 +89,29 @@ impl Browser {
         if profile_locked(&user_data_dir) {
             return Err(Error::ProfileInUse(user_data_dir));
         }
-        let active_port_file = user_data_dir.join("DevToolsActivePort");
-        let _ = std::fs::remove_file(&active_port_file);
-
-        let args = config.build_args(&user_data_dir, config.port.unwrap_or(0));
+        let port = match config.port {
+            Some(p) => p,
+            None => free_port(&config.host)?,
+        };
+        let args = config.build_args(&user_data_dir, port);
         tracing::debug!("launching {} {}", exe.display(), args.join(" "));
-        let mut child = Command::new(&exe)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| Error::Launch(format!("{}: {e}", exe.display())))?;
+        let mut child = match spawn {
+            Some(spawn) => {
+                spawn(&exe, &args).map_err(|e| Error::Launch(format!("{}: {e}", exe.display())))?;
+                None
+            }
+            None => Some(
+                Command::new(&exe)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| Error::Launch(format!("{}: {e}", exe.display())))?,
+            ),
+        };
 
-        let (port, path) = wait_active_port(&active_port_file, &mut child).await?;
-        let ws_url = format!("ws://{}:{port}{path}", config.host);
+        let ws_url = wait_debugger(&config.host, port, child.as_mut()).await?;
         let conn = Connection::connect(&ws_url).await?;
         let browser_pid = browser_pid(&conn).await;
         Ok(Self {
@@ -94,7 +119,7 @@ impl Browser {
             ws_url,
             host: config.host.clone(),
             port,
-            launcher: Mutex::new(Some(child)),
+            launcher: Mutex::new(child),
             browser_pid,
             user_data_dir: Some(user_data_dir),
             temp_profile: Mutex::new(temp_profile),
@@ -296,30 +321,41 @@ async fn browser_pid(conn: &Connection) -> Option<u32> {
         .map(|id| id as u32)
 }
 
-/// Waits for `DevToolsActivePort` (line 1: port, line 2: websocket path).
-async fn wait_active_port(file: &Path, child: &mut Child) -> Result<(u16, String)> {
+/// Waits for `/json/version` on the debug port and returns the browser websocket url.
+async fn wait_debugger(host: &str, port: u16, mut child: Option<&mut Child>) -> Result<String> {
     let start = Instant::now();
     loop {
-        if let Ok(text) = std::fs::read_to_string(file) {
-            let mut lines = text.lines();
-            if let (Some(p), Some(path)) = (lines.next(), lines.next()) {
-                if let Ok(port) = p.trim().parse::<u16>() {
-                    return Ok((port, path.trim().to_string()));
-                }
-            }
+        let probe = tokio::time::timeout(Duration::from_secs(1), http_json(host, port, "/json/version"));
+        if let Ok(Ok(info)) = probe.await
+            && let Some(ws) = info.get("webSocketDebuggerUrl").and_then(Value::as_str)
+        {
+            return Ok(ws.to_string());
         }
         // Exit code 0 is normal: Edge relaunches itself and the first process exits.
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                return Err(Error::Launch(format!("browser exited with {status}")));
-            }
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            return Err(Error::Launch(format!("browser exited with {status}")));
         }
         if start.elapsed() > LAUNCH_TIMEOUT {
-            let _ = child.kill().await;
-            return Err(Error::Launch("DevToolsActivePort was not written in time".into()));
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill().await;
+            }
+            return Err(Error::Launch(format!("no DevTools endpoint on {host}:{port}")));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A free TCP port on `host`, as nodriver's `util.free_port`. The port is released before the
+/// browser binds it.
+///
+/// A fixed port also matters for detection: with `--remote-debugging-port=0`, Edge 155 reports
+/// `navigator.webdriver === true`; with a fixed port it reports `false`.
+fn free_port(host: &str) -> Result<u16> {
+    let l = std::net::TcpListener::bind((host, 0))?;
+    Ok(l.local_addr()?.port())
 }
 
 /// Whether a running browser holds the profile.

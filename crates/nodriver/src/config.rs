@@ -35,8 +35,8 @@ pub struct Config {
     pub lang: Option<String>,
     /// `--remote-debugging-host`.
     pub host: String,
-    /// `--remote-debugging-port`. `None` lets the browser pick a free port, read back from
-    /// `DevToolsActivePort` in the profile.
+    /// `--remote-debugging-port`. `None` picks a free port before launching (port 0 is not used:
+    /// Edge reports `navigator.webdriver === true` with it).
     pub port: Option<u16>,
     /// Adds `--disable-site-isolation-trials` (nodriver's "expert" mode flag).
     pub expert: bool,
