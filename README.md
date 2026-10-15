@@ -1,3 +1,7 @@
+> **This fork contains a Rust port of nodriver** in [`crates/`](crates/): the `nodriver` crate
+> ([README](crates/nodriver/README.md)) and `nodriver-cdp` (generated CDP types). The original Python
+> package is kept below, unchanged, as the reference for the port.
+
 
 
 

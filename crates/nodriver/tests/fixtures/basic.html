@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Basic</title></head>
+<body>
+  <h1>Hello</h1>
+  <button id="btn" onclick="window.clicks = (window.clicks || 0) + 1; document.getElementById('out').textContent = 'clicked ' + window.clicks">Click me</button>
+  <div id="out"></div>
+
+  <form id="form" onsubmit="event.preventDefault(); document.getElementById('submitted').textContent = document.getElementById('name').value">
+    <input id="name" name="name" placeholder="Your name">
+  </form>
+  <div id="submitted"></div>
+
+  <input id="file" type="file" multiple onchange="document.getElementById('files').textContent = Array.from(this.files).map(f => f.name).join(',')">
+  <div id="files"></div>
+
+  <select id="sel" onchange="document.getElementById('chosen').textContent = this.value">
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+  </select>
+  <div id="chosen"></div>
+
+  <p>Some text before. <span id="exact">Find this exact phrase</span> and after.</p>
+  <p id="long">Find this exact phrase inside a much longer paragraph with many other words around it.</p>
+
+  <div id="host"></div>
+  <script>
+    const root = document.getElementById('host').attachShadow({ mode: 'open' });
+    root.innerHTML = '<button id="shadowbtn" onclick="this.textContent = \'Shadow clicked\'">Shadow button</button>';
+    setTimeout(() => {
+      const d = document.createElement('div');
+      d.id = 'late';
+      d.textContent = 'Late element';
+      document.body.appendChild(d);
+    }, 600);
+    window.keys = [];
+    document.addEventListener('keydown', (e) => window.keys.push(e.key));
+  </script>
+</body>
+</html>
