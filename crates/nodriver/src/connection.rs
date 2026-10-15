@@ -110,6 +110,8 @@ struct Link {
 struct Sessions {
     by_target: HashMap<String, String>,
     by_session: HashMap<String, String>,
+    /// Sessions created by auto-attach (not re-attached after a reconnection).
+    adopted: std::collections::HashSet<String>,
 }
 
 struct Inner {
@@ -216,10 +218,43 @@ impl Connection {
             return Ok(s);
         }
         let session = attach_raw(&self.inner, target_id).await?;
-        let mut s = self.inner.sessions.lock().unwrap();
-        s.by_session.insert(session.clone(), target_id.to_string());
-        s.by_target.insert(target_id.to_string(), session.clone());
+        let existing = {
+            let mut s = self.inner.sessions.lock().unwrap();
+            match s.by_target.get(target_id).cloned() {
+                Some(e) => Some(e),
+                None => {
+                    s.by_session.insert(session.clone(), target_id.to_string());
+                    s.by_target.insert(target_id.to_string(), session.clone());
+                    None
+                }
+            }
+        };
+        if let Some(e) = existing {
+            // A session was adopted (auto-attach) while this one was being created: keep one.
+            let _ = self
+                .call("Target.detachFromTarget", json!({ "sessionId": session }), None)
+                .await;
+            return Ok(e);
+        }
         Ok(session)
+    }
+
+    /// Registers a session the browser created by itself (`Target.setAutoAttach` with
+    /// `flatten: true` reports it in `Target.attachedToTarget`), so [`Connection::attach`] and
+    /// `Browser::tab` reuse it instead of opening a second session on the same target. Returns
+    /// `false` when the target already has a session.
+    ///
+    /// The session is not re-attached after a reconnection: auto-attach attaches the target
+    /// again when `Target.setAutoAttach` is sent on the new parent session.
+    pub fn adopt(&self, target_id: &str, session_id: &str) -> bool {
+        let mut s = self.inner.sessions.lock().unwrap();
+        if s.by_target.contains_key(target_id) {
+            return false;
+        }
+        s.by_session.insert(session_id.to_string(), target_id.to_string());
+        s.by_target.insert(target_id.to_string(), session_id.to_string());
+        s.adopted.insert(session_id.to_string());
+        true
     }
 
     /// Stops tracking a target (after it was closed).
@@ -367,9 +402,19 @@ impl Connection {
         }
 
         let targets: Vec<String> = {
-            let mut s = self.inner.sessions.lock().unwrap();
+            let mut guard = self.inner.sessions.lock().unwrap();
+            let s = &mut *guard;
+            let adopted: std::collections::HashSet<String> = s
+                .adopted
+                .drain()
+                .filter_map(|session| s.by_session.get(&session).cloned())
+                .collect();
             s.by_session.clear();
-            s.by_target.drain().map(|(t, _)| t).collect()
+            s.by_target
+                .drain()
+                .map(|(t, _)| t)
+                .filter(|t| !adopted.contains(t))
+                .collect()
         };
         for target in targets {
             match attach_raw(&self.inner, &target).await {
@@ -558,6 +603,18 @@ impl Inner {
             .session_id
             .as_ref()
             .and_then(|s| self.sessions.lock().unwrap().by_session.get(s).cloned());
+        if method == "Target.detachedFromTarget"
+            && let Some(gone) = ev.params.get("sessionId").and_then(Value::as_str)
+        {
+            // The session ended (target closed, or an auto-attached frame went away).
+            let mut s = self.sessions.lock().unwrap();
+            if let Some(t) = s.by_session.remove(gone)
+                && s.by_target.get(&t).is_some_and(|x| x == gone)
+            {
+                s.by_target.remove(&t);
+            }
+            s.adopted.remove(gone);
+        }
         self.subscribers
             .lock()
             .unwrap()

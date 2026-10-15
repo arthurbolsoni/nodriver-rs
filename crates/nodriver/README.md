@@ -148,6 +148,13 @@ All methods are `async` and return `nodriver::Result`.
 - `Element::set_value` sets the `value` property and fires `input`/`change`; nodriver's
   `DOM.setNodeValue` only changes text nodes, which is `set_text` here.
 - `text_all` trims each text node and skips the empty ones.
+- Sessions the browser creates by itself (`Target.setAutoAttach { flatten: true }`, reported in
+  `Target.attachedToTarget`) can be registered with `Connection::adopt(target_id, session_id)`;
+  `Browser::tab` and `Connection::attach` then reuse them instead of opening a second session on
+  the same target. A session is forgotten on `Target.detachedFromTarget`. Adopted sessions are not
+  re-attached after a reconnection (auto-attach attaches them again).
+- `Browser::tabs` keeps cached `Tab`s of other target types (cross-site iframes, workers) while
+  their target exists.
 
 ## Dropping a browser without `close`
 

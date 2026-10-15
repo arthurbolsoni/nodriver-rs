@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>child</title></head>
+<body>
+<p id="out">waiting</p>
+<script>
+  fetch('/api/data').then((r) => r.json()).then((d) => { document.getElementById('out').textContent = 'ok ' + d.items.length; });
+</script>
+</body>
+</html>

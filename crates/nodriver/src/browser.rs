@@ -307,13 +307,10 @@ impl Browser {
 
     /// Open tabs (targets of type `page`), in the order the browser lists them.
     pub async fn tabs(&self) -> Result<Vec<Tab>> {
-        let pages: Vec<target::TargetInfo> = self
-            .targets()
-            .await?
-            .into_iter()
-            .filter(|t| t.r#type == "page")
-            .collect();
-        let alive: Vec<String> = pages.iter().map(|t| t.target_id.clone()).collect();
+        let all = self.targets().await?;
+        // Cached tabs of other target types (iframes, workers) stay while their target lives.
+        let alive: Vec<String> = all.iter().map(|t| t.target_id.clone()).collect();
+        let pages: Vec<target::TargetInfo> = all.into_iter().filter(|t| t.r#type == "page").collect();
         self.tabs.lock().unwrap().retain(|id, _| {
             let keep = alive.contains(id);
             if !keep {
