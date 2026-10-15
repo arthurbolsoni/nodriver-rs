@@ -335,12 +335,34 @@ impl Tab {
         Ok(())
     }
 
-    /// Presses and releases a named key: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`,
-    /// `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or a
-    /// single character.
+    /// Presses and releases a key, optionally with modifiers: `Enter`, `Tab`, `Escape`,
+    /// `Backspace`, `Delete`, `Insert`, `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`,
+    /// `PageDown`, `Space`, `F1`..`F12`, or a single character; modifiers are joined with `+`
+    /// (`Control+a`, `Shift+Tab`, `Control+Shift+K`; `Ctrl`, `Alt`, `Shift`, `Meta`).
     pub async fn press_key(&self, key: &str) -> Result<()> {
+        let (mods, key) = split_modifiers(key);
         let (key_name, code, vk, text) =
             key_info(key).ok_or_else(|| Error::NotFound(format!("key {key}")))?;
+        let bits: i64 = mods.iter().map(|m| m.bit).sum();
+        let mut held = 0;
+        for m in &mods {
+            held |= m.bit;
+            let mut p = input::DispatchKeyEventParams::new(input::DispatchKeyEventType::RawKeyDown);
+            p.key = Some(m.key.into());
+            p.code = Some(m.code.into());
+            p.windows_virtual_key_code = Some(m.vk);
+            p.native_virtual_key_code = Some(m.vk);
+            p.modifiers = Some(held);
+            self.send(&p).await?;
+        }
+        // With Ctrl, Alt or Meta held the key is a shortcut and inserts no text.
+        let text = if bits & !SHIFT != 0 {
+            None
+        } else if bits & SHIFT != 0 {
+            text.map(|t| t.to_uppercase())
+        } else {
+            text
+        };
         let mut down = input::DispatchKeyEventParams::new(if text.is_some() {
             input::DispatchKeyEventType::KeyDown
         } else {
@@ -352,13 +374,25 @@ impl Tab {
         down.native_virtual_key_code = Some(vk);
         down.text = text.clone();
         down.unmodified_text = text;
+        down.modifiers = Some(bits);
         self.send(&down).await?;
         let mut up = input::DispatchKeyEventParams::new(input::DispatchKeyEventType::KeyUp);
         up.key = Some(key_name);
         up.code = Some(code);
         up.windows_virtual_key_code = Some(vk);
         up.native_virtual_key_code = Some(vk);
+        up.modifiers = Some(bits);
         self.send(&up).await?;
+        for m in mods.iter().rev() {
+            held &= !m.bit;
+            let mut p = input::DispatchKeyEventParams::new(input::DispatchKeyEventType::KeyUp);
+            p.key = Some(m.key.into());
+            p.code = Some(m.code.into());
+            p.windows_virtual_key_code = Some(m.vk);
+            p.native_virtual_key_code = Some(m.vk);
+            p.modifiers = Some(held);
+            self.send(&p).await?;
+        }
         Ok(())
     }
 
@@ -415,6 +449,57 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
+const SHIFT: i64 = 8;
+
+struct Modifier {
+    key: &'static str,
+    code: &'static str,
+    vk: i64,
+    /// `Input.dispatchKeyEvent` modifier bit: Alt=1, Ctrl=2, Meta=4, Shift=8.
+    bit: i64,
+}
+
+/// Splits `Control+Shift+k` into the modifiers and the key. A trailing `+` is the key itself.
+fn split_modifiers(combo: &str) -> (Vec<Modifier>, &str) {
+    let mut mods = Vec::new();
+    let mut rest = combo;
+    while let Some(i) = rest.find('+') {
+        if i == 0 || i + 1 == rest.len() {
+            break;
+        }
+        let m = match rest[..i].to_ascii_lowercase().as_str() {
+            "control" | "ctrl" => Modifier {
+                key: "Control",
+                code: "ControlLeft",
+                vk: 17,
+                bit: 2,
+            },
+            "shift" => Modifier {
+                key: "Shift",
+                code: "ShiftLeft",
+                vk: 16,
+                bit: SHIFT,
+            },
+            "alt" => Modifier {
+                key: "Alt",
+                code: "AltLeft",
+                vk: 18,
+                bit: 1,
+            },
+            "meta" | "cmd" | "win" => Modifier {
+                key: "Meta",
+                code: "MetaLeft",
+                vk: 91,
+                bit: 4,
+            },
+            _ => break,
+        };
+        mods.push(m);
+        rest = &rest[i + 1..];
+    }
+    (mods, rest)
+}
+
 /// (key, code, windows virtual key code, text)
 fn key_info(key: &str) -> Option<(String, String, i64, Option<String>)> {
     let named = |k: &str, code: &str, vk: i64, text: Option<&str>| {
@@ -426,6 +511,7 @@ fn key_info(key: &str) -> Option<(String, String, i64, Option<String>)> {
         "Escape" | "Esc" => named("Escape", "Escape", 27, None),
         "Backspace" => named("Backspace", "Backspace", 8, None),
         "Delete" => named("Delete", "Delete", 46, None),
+        "Insert" => named("Insert", "Insert", 45, None),
         "ArrowUp" => named("ArrowUp", "ArrowUp", 38, None),
         "ArrowDown" => named("ArrowDown", "ArrowDown", 40, None),
         "ArrowLeft" => named("ArrowLeft", "ArrowLeft", 37, None),
@@ -435,6 +521,13 @@ fn key_info(key: &str) -> Option<(String, String, i64, Option<String>)> {
         "PageUp" => named("PageUp", "PageUp", 33, None),
         "PageDown" => named("PageDown", "PageDown", 34, None),
         "Space" | " " => named(" ", "Space", 32, Some(" ")),
+        f if f.len() >= 2
+            && f.starts_with('F')
+            && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) =>
+        {
+            let n: i64 = f[1..].parse().unwrap();
+            named(f, f, 111 + n, None)
+        }
         _ => {
             let mut cs = key.chars();
             let c = cs.next()?;

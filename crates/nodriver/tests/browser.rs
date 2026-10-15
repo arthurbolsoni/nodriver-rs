@@ -138,6 +138,14 @@ async fn typing_keys_and_select_option() {
     let beta = tab.select("#sel option[value=b]").await.unwrap();
     beta.select_option().await.unwrap();
     assert_eq!(tab.select("#chosen").await.unwrap().text().await.unwrap(), "b");
+
+    // Shortcut with a modifier: Control+a selects everything, typing replaces it.
+    input.send_keys("abc").await.unwrap();
+    tab.press_key("Control+a").await.unwrap();
+    tab.press_key("x").await.unwrap();
+    assert_eq!(input.value().await.unwrap().as_deref(), Some("x"));
+    tab.press_key("Shift+b").await.unwrap();
+    assert_eq!(input.value().await.unwrap().as_deref(), Some("xB"));
     browser.close().await.unwrap();
 }
 
